@@ -39,6 +39,7 @@ strace -f java -Djava.library.path=/usr/lib/micro-manager -classpath /usr/share/
 #include "../../MMDevice/MMDevice.h"
 #include "../../MMDevice/DeviceBase.h"
 #include "../../MMDevice/ModuleInterface.h"
+#include "../../MMDevice/ImgBuffer.h"
 #include <sstream>
 #include <map>
 #include <vector>
@@ -68,6 +69,7 @@ struct VidBuffer {
   size_t length;
 };
 
+// v4l2 state
 typedef struct State State;
 struct State {
   int W,H,fd;
@@ -76,6 +78,97 @@ struct State {
   struct v4l2_buffer*buf;
 };
 
+class PixelType {
+  public:
+    PixelType(string propertyValue, unsigned bytesPerPixel, unsigned numberOfComponents, unsigned bitDepth) :
+      m_propertyValue(propertyValue),
+      m_bytesPerPixel(bytesPerPixel),
+      m_numberOfComponents(numberOfComponents),
+      m_bitDepth(bitDepth) {
+      }
+
+    string GetPropertyValue() const { return m_propertyValue; }
+    unsigned GetImageBytesPerPixel() const { return m_bytesPerPixel; }
+    unsigned GetBitDepth() const { return m_bitDepth; }
+    unsigned GetNumberOfComponents() const { return m_numberOfComponents; }
+
+    virtual void convertV4l2ToOutput(
+        State *state, unsigned char* in, unsigned char* output) const = 0;
+  private:
+    string m_propertyValue;
+    unsigned m_bytesPerPixel;
+    unsigned m_bitDepth;
+    unsigned m_numberOfComponents;
+};
+
+class PixelType8Bit : public PixelType {
+  public:
+    static string PROPERTY_VALUE;
+
+    PixelType8Bit() :
+      PixelType(PROPERTY_VALUE, 1, 1, 8) {
+      }
+
+    virtual void convertV4l2ToOutput(
+        State *state, unsigned char* in, unsigned char* output) const {
+      int i,j;
+      for (j = 0; j < state->H; j++) {
+        int wj = state->W * j;
+        for (i = 0; i < state->W; i++) {
+          output[i + wj] = in[2*i + 2*wj];
+        }
+      }
+    }
+};
+string PixelType8Bit::PROPERTY_VALUE = "8bit";
+PixelType8Bit PIXELTYPE_8BIT;
+
+class PixelTypeYUYV : public PixelType {
+  public:
+    static string PROPERTY_VALUE;
+
+    PixelTypeYUYV() :
+      PixelType(PROPERTY_VALUE, 4, 4, 16) {
+      }
+
+    virtual void convertV4l2ToOutput(
+        State *state, unsigned char* ptrIn, unsigned char* ptrOut) const {
+      /* Convert YUYV to RGBA32, apparently mm does only display colors
+       * in this format */
+      for (int i = 0;  i < state->W * state->H / 2; ++i) {
+        int y0 = ptrIn[0];
+        int u0 = ptrIn[1];
+        int y1 = ptrIn[2];
+        int v0 = ptrIn[3];
+        ptrIn += 4;
+        int c = y0 - 16;
+        int d = u0 - 128;
+        int e = v0 - 128;
+        ptrOut[0] = clip((298 * c + 516 * d + 128) >> 8); // blue
+        ptrOut[1] = clip((298 * c - 100 * d - 208 * e + 128) >> 8); // green
+        ptrOut[2] = clip((298 * c + 409 * e + 128) >> 8); // red
+        ptrOut[4] = 255; // alpha
+        c = y1 - 16;
+        ptrOut[4] = clip((298 * c + 516 * d + 128) >> 8); // blue
+        ptrOut[5] = clip((298 * c - 100 * d - 208 * e + 128) >> 8); // green
+        ptrOut[6] = clip((298 * c + 409 * e + 128) >> 8); // red
+        ptrOut[7] = 255; // alpha
+        ptrOut += 8;
+      }
+    }
+
+  private:
+    inline unsigned char clip(int val) const {
+      if (val <= 0)
+        return 0;
+      else if (val >= 255)
+        return 255;
+      else
+        return val;
+    }
+};
+string PixelTypeYUYV::PROPERTY_VALUE = "YUYV";
+PixelTypeYUYV PIXELTYPE_YUYV;
 
 /*
 int
@@ -173,8 +266,12 @@ VideoInit(State*state)
 
   if(-1==state->fd)
     {
-    LogMessage("v4l2: ould not open the video device");
+    LogMessage("v4l2: could not open the video device");
     return false;
+    }
+  else
+    {
+    LogMessage("v4l2: opened device");
     }
 
   sleep(3); // let it settle; there is probably an ioctl for this
@@ -184,6 +281,7 @@ VideoInit(State*state)
   struct v4l2_format format; 
   memset(&format,0,sizeof(format));
   format.type=V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  // TODO probe px
   format.fmt.pix.width=state->W;
   format.fmt.pix.height=state->H;
   format.fmt.pix.pixelformat=V4L2_PIX_FMT_YUYV;
@@ -248,6 +346,10 @@ VideoInit(State*state)
     LogMessage("v4l2: could not initialize stream");
     return false;
     }
+  else
+    {
+    LogMessage("v4l2: initialized data stream");
+    }
   return true;
 }
 
@@ -261,10 +363,10 @@ VideoInit(State*state)
   // properties we need for defining initialisation parameters, do as
   // little as possible, don't access hardware, do everything else in
   // Initialize()
-  V4L2()
+  V4L2() :
+    pixelType(&PIXELTYPE_8BIT)
   {
     initialized_=0;
-    image=NULL;
     state->W=gWidth;
     state->H=gHeight;
   }
@@ -274,11 +376,6 @@ VideoInit(State*state)
   ~V4L2()
   {
     Shutdown();
-    if(image)
-      {
-      free(image);
-      image=NULL;
-      }
   }
 
   // access hardware, create device properties
@@ -286,6 +383,7 @@ VideoInit(State*state)
   {
     if(initialized_)
       return DEVICE_OK;
+    LogMessage("v4l2: initializing device driver");
     CreateProperty(MM::g_Keyword_Name,gName,
 		   MM::String, true);
     CreateProperty(MM::g_Keyword_Description, gDescription,
@@ -297,12 +395,21 @@ VideoInit(State*state)
 			      "1", MM::Integer, false, pAct);
     if (nRet != DEVICE_OK)
       return nRet;
+
     // Pixel type
     pAct = new CPropertyAction (this, &V4L2::OnPixelType);
     nRet = CreateProperty(MM::g_Keyword_PixelType,
-			  "8bit", MM::String,true, pAct);
+			  PixelTypeYUYV::PROPERTY_VALUE.c_str(), MM::String, false, pAct);
     if (nRet != DEVICE_OK)
-      return nRet;
+       return nRet;
+
+    vector<string> pixTypes;
+    pixTypes.push_back(PixelType8Bit::PROPERTY_VALUE);
+    pixTypes.push_back(PixelTypeYUYV::PROPERTY_VALUE);
+    nRet = SetAllowedValues(MM::g_Keyword_PixelType, pixTypes);
+    if (nRet != DEVICE_OK)
+       return nRet;
+
     // Gain
     pAct = new CPropertyAction (this, &V4L2::OnGain);
     nRet = CreateProperty(MM::g_Keyword_Gain,
@@ -314,7 +421,11 @@ VideoInit(State*state)
 			  "0.0", MM::Float, false, pAct);
     assert(nRet == DEVICE_OK);
     
-    image = (unsigned char*) malloc(state->W*state->H);
+    nRet = this->resizeBuffer();
+    if (nRet != DEVICE_OK)
+       return nRet;
+
+    LogMessage("v4l2: calling video init");
     if(VideoInit(state))
       {
       initialized_=true;
@@ -325,7 +436,6 @@ VideoInit(State*state)
       initialized_=false;
       return DEVICE_ERR;
       }
-    //VideoRunThread(state,image);
   }
 
   // Shutdown is called multiple times, Initialize will be called
@@ -346,51 +456,27 @@ VideoInit(State*state)
   // blocks until exposure is finished
   int SnapImage()
   {
-    unsigned char*data=VideoTakeBuffer(state);
-    int i,j;
-    for(j=0;j<state->H;j++){
-      int wj=state->W*j;
-      for(i=0;i<state->W;i++){
-	image[i+wj]=data[2*i+2*wj];
-      }
-    }
+    LogMessage("v4l2: snap image called"); // TODO remove
+    unsigned char* data = VideoTakeBuffer(state);
+    pixelType->convertV4l2ToOutput(state, data, const_cast<unsigned char*>(imageBuffer.GetPixels()));
     VideoReturnBuffer(state);
+    LogMessage("v4l2: snap image returning data"); // TODO remove
     return DEVICE_OK;
   }
 
   // waits for camera readout
   const unsigned char* GetImageBuffer()
   {
-    return image;
+    return imageBuffer.GetPixels();
   }
 
   // changes only if binning, pixel type, ... properties are set
-  long GetImageBufferSize() const
-  {
-    return state->W*state->H;
-  }
-
-  unsigned GetImageWidth() const 
-  {
-    return state->W;
-  }
-
-  unsigned GetImageHeight() const 
-  {
-    return state->H;
-  }
-
-  unsigned GetImageBytesPerPixel() const
-  {
-    // FIXME
-    return 1; //get_image_bytes_per_pixel();
-  }
-
-  unsigned GetBitDepth() const 
-  {
-    // FIXME
-    return 8;// get_bit_depth();
-  }
+  unsigned GetImageWidth() const {return imageBuffer.Width();}
+  unsigned GetImageHeight() const {return imageBuffer.Height();}
+  unsigned GetImageBytesPerPixel() const {return imageBuffer.Depth();} 
+  long GetImageBufferSize() const {return GetImageWidth() * GetImageHeight() * GetImageBytesPerPixel();}
+  unsigned GetBitDepth() const { return pixelType->GetBitDepth(); }
+  unsigned GetNumberOfComponents() const { return pixelType->GetNumberOfComponents(); }
 
   int SetROI(unsigned x,unsigned y,unsigned xSize,unsigned ySize)
   {
@@ -474,6 +560,27 @@ VideoInit(State*state)
   
   int OnPixelType(MM::PropertyBase* pProp, MM::ActionType eAct)
   {
+    if (eAct == MM::AfterSet)
+    {
+      string pixType;
+      pProp->Get(pixType);
+      if (pixType == PixelType8Bit::PROPERTY_VALUE) {
+        pixelType = &PIXELTYPE_8BIT;
+      }
+      else if (pixType == PixelTypeYUYV::PROPERTY_VALUE) {
+        pixelType = &PIXELTYPE_YUYV;
+      }
+      else {
+        return DEVICE_INVALID_PROPERTY;
+      }
+  
+      LogMessage("v4l2: setting pixelType " + pixelType->GetPropertyValue());
+      return this->resizeBuffer();
+    }
+    else if (eAct == MM::BeforeGet)
+    {
+      pProp->Set(pixelType->GetPropertyValue().c_str());
+    }
     return DEVICE_OK;
   }
 
@@ -487,9 +594,15 @@ VideoInit(State*state)
   }
   
 private:
+  int resizeBuffer() {
+    imageBuffer.Resize(state->W, state->H, pixelType->GetImageBytesPerPixel());
+    return DEVICE_OK;
+  }
+
   bool initialized_;
   State state[1];
-  unsigned char *image;
+  ImgBuffer imageBuffer;
+  PixelType *pixelType;
 };
 
 MODULE_API void InitializeModuleData()
