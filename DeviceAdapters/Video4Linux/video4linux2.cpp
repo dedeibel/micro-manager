@@ -21,6 +21,15 @@ sudo cp libmmgr_dal_video4linux2.so /usr/lib/micro-manager/libmmgr_dal_video4lin
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/micro-manager
 cd /usr/share/imagej
 strace -f java -Djava.library.path=/usr/lib/micro-manager -classpath /usr/share/imagej/plugins/bsh-2.0b4.jar:/usr/share/imagej/ij.jar:/usr/share/imagej/plugins/Micro-Manager/MMJ_.jar org/micromanager/MMStudioMainFrame
+*
+* Modified:
+*
+* 2018-01-20 Benjamin Peter
+*
+*            * Adding support for RGB image capturing
+*            * Specify linux device path
+*            * v4l2 configured device resolution
+*
 */
 // LICENSE:       This file is distributed under the "LGPL" license.
 //
@@ -46,12 +55,13 @@ strace -f java -Djava.library.path=/usr/lib/micro-manager -classpath /usr/share/
 
 #include <sys/ioctl.h>
 #include <linux/videodev2.h>
-#include <stdio.h>
+#include <cstdio>
 #include <fcntl.h>
 #include <unistd.h>
 #include <assert.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstring>
+#include <cerrno>
 #include <sys/mman.h>
 
 #include <pthread.h>
@@ -60,22 +70,27 @@ using namespace std;
 
 const char
   *gName="Video4Linux2",
-  *gDescription="video4linux2 camera device adapter";
+  *gDescription="video4linux2 camera device adapter",
+  *gPropertyDevicePath = "DevicePath",
+  *gPropertyDevicePathDefault = "/dev/video0",
+  *gPropertyNameWidth = "ResolutionWidth",
+  *gPropertyNameHeight = "ResolutionHeight";
 
-const int gWidth=640, gHeight=480;
+const long gWidthDefault = 640,
+           gHeightDefault = 480;
 
 struct VidBuffer {
-  void*start;
+  void *start;
   size_t length;
 };
 
 // v4l2 state
 typedef struct State State;
 struct State {
-  int W,H,fd;
+  int W, H, fd;
   struct VidBuffer *buffers;
   unsigned int buffers_count;
-  struct v4l2_buffer*buf;
+  struct v4l2_buffer *buf;
 };
 
 class PixelType {
@@ -144,6 +159,7 @@ class PixelTypeYUYV : public PixelType {
         int c = y0 - 16;
         int d = u0 - 128;
         int e = v0 - 128;
+
         ptrOut[0] = clip((298 * c + 516 * d + 128) >> 8); // blue
         ptrOut[1] = clip((298 * c - 100 * d - 208 * e + 128) >> 8); // green
         ptrOut[2] = clip((298 * c + 409 * e + 128) >> 8); // red
@@ -170,194 +186,234 @@ class PixelTypeYUYV : public PixelType {
 string PixelTypeYUYV::PROPERTY_VALUE = "YUYV";
 PixelTypeYUYV PIXELTYPE_YUYV;
 
-/*
-int
-VideoControl(State*state,int id,int dvalue)
-{
-  //int type=V4L2_BUF_TYPE_VIDEO_CAPTURE; assert(-1!=ioctl(state->fd,VIDIOC_STREAMOFF,&type));
- 
-  struct v4l2_queryctrl qctl;
-  memset(&qctl,0,sizeof(qctl));
-  qctl.id=id;
-  if(-1==ioctl(state->fd,VIDIOC_QUERYCTRL,&qctl))
-    return -1;
-  if(qctl.flags & V4L2_CTRL_FLAG_DISABLED)
-    printf("control is not supported\n");
- 
-  struct v4l2_control ctl;
-  memset(&ctl,0,sizeof(ctl));
-  ctl.id=qctl.id;
-  if(-1==ioctl(state->fd,VIDIOC_G_CTRL,&ctl))
-    return -2;
-  // +=
-  ctl.value=dvalue;//qctl.default_value;
-  if(-1==ioctl(state->fd,VIDIOC_S_CTRL,&ctl))
-    return -3;
- 
-  if(-1==ioctl(state->fd,VIDIOC_G_CTRL,&ctl))
-    return -4;
-  return ctl.value;
-  // type=V4L2_BUF_TYPE_VIDEO_CAPTURE;  assert(-1!=ioctl(state->fd,VIDIOC_STREAMON,&type));
-} 
-*/
-
-/*  has to be followed by a call to videoreturnbuffer */
-unsigned char*
-VideoTakeBuffer(State*state)
-{
-  fd_set fds;
-  FD_ZERO(&fds);
-  FD_SET(state->fd,&fds);
-  struct timeval tv;
-  tv.tv_sec=10;
-  tv.tv_usec=0;
-  assert(0<select(state->fd+1,&fds,NULL,NULL,&tv));
- 
-  memset(state->buf,0,sizeof(struct v4l2_buffer));
-  state->buf->type=V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  state->buf->memory=V4L2_MEMORY_MMAP;
-  // http://v4l2spec.bytesex.org/spec/r12878.htm: By default
-  // VIDIOC_DQBUF blocks when no buffer is in the outgoing queue
-  assert(-1!=ioctl(state->fd,VIDIOC_DQBUF,state->buf));
-
-  assert(state->buf->index<state->buffers_count);
-
-  return (unsigned char*)state->buffers[state->buf->index].start;
-}
-
-void
-VideoReturnBuffer(State*state)
-{
-  assert(-1!=ioctl(state->fd,VIDIOC_QBUF,state->buf));
-}
-
-void
-VideoClose(State*state)
-{
-  int type=V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  assert(-1!=ioctl(state->fd,VIDIOC_STREAMOFF,&type));
-  unsigned int i;
-  for(i=0;i<state->buffers_count;i++)
-    munmap(state->buffers[i].start,state->buffers[i].length);
-  close(state->fd);
-  free(state->buf);
-}
-
-
 class V4L2 : public CCameraBase<V4L2>
 {
 public:
-
-
-/**
- * TODO: implement if possible
- */
-int IsExposureSequenceable(bool& isSequenceable) const 
-{
-   isSequenceable = false; 
-   return DEVICE_OK;
-}
-
-bool
-VideoInit(State*state)
-{
-  state->fd=open("/dev/video0",O_RDWR);
-//// this should probably be a property
-
-  if(-1==state->fd)
-    {
-    LogMessage("v4l2: could not open the video device");
-    return false;
-    }
-  else
-    {
-    LogMessage("v4l2: opened device");
+  /*  has to be followed by a call to videoreturnbuffer */
+  unsigned char*
+  VideoTakeBuffer(State*state)
+  {
+    memset(state->buf, 0, sizeof(struct v4l2_buffer));
+    state->buf->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    state->buf->memory = V4L2_MEMORY_MMAP;
+    // By default VIDIOC_DQBUF blocks when no buffer is in the outgoing queue
+    if (-1 == tryIoctl(state->fd, VIDIOC_DQBUF, state->buf)) {
+      ostringstream msg;
+      msg << "error: could not prepare next image buffer: " << strerror(errno);
+      LogMessage(msg.str().c_str());
+      assert(false);
     }
 
-  sleep(3); // let it settle; there is probably an ioctl for this
-
-  state->buf=(struct v4l2_buffer*) malloc(sizeof(struct v4l2_buffer));
-
-  struct v4l2_format format; 
-  memset(&format,0,sizeof(format));
-  format.type=V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  // TODO probe px
-  format.fmt.pix.width=state->W;
-  format.fmt.pix.height=state->H;
-  format.fmt.pix.pixelformat=V4L2_PIX_FMT_YUYV;
-  if(-1==ioctl(state->fd,VIDIOC_S_FMT,&format))
-    {
-    LogMessage("v4l2: could not set YUYV format");
-    return false;
-    }
-
-  state->W=format.fmt.pix.width;
-  state->H=format.fmt.pix.height;
-  //printf("size %dx%d\n",format.fmt.pix.width,format.fmt.pix.height);
- 
-  struct v4l2_requestbuffers reqbuf;
-  memset(&reqbuf,0,sizeof(reqbuf));
-  reqbuf.type=V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  reqbuf.memory=V4L2_MEMORY_MMAP;
-  reqbuf.count=4;
-  assert(-1!=ioctl(state->fd,VIDIOC_REQBUFS,&reqbuf));
-  //printf("number of buffers: %d\n",reqbuf.count);
- 
-  state->buffers=(struct VidBuffer*)calloc(reqbuf.count,sizeof(*(state->buffers)));
-  if(!state->buffers)
-    {
-    LogMessage("v4l2: could not allocate buffer(s)");
-    return false;
-    }
-  unsigned int i;
-  for(i=0;i<reqbuf.count;i++){
-    struct v4l2_buffer buf;
-    memset(&buf,0,sizeof(buf));
- 
-    buf.type=reqbuf.type;
-    buf.memory=V4L2_MEMORY_MMAP;
-    buf.index=i;
-    if(-1==ioctl(state->fd,VIDIOC_QUERYBUF,&buf))
-      {
-      LogMessage("v4l2: could not query the buffer state");
-      return false;
-      }
- 
-    state->buffers[i].length=buf.length; // remember for munmap
-    state->buffers[i].start=mmap(NULL,buf.length,
-			  PROT_READ|PROT_WRITE,
-			  MAP_SHARED,state->fd,buf.m.offset);
-    if(state->buffers[i].start==MAP_FAILED)
-      {
-      LogMessage("v4l2: memory map failed");
-      return false;
-      }
- 
-    if(-1==ioctl(state->fd,VIDIOC_QBUF,&buf))
-      {
-      LogMessage("v4l2: could not enqueue buffer");
-      return false;
-      }
+    assert(state->buf->index < state->buffers_count);
+    return (unsigned char*)state->buffers[state->buf->index].start;
   }
-  state->buffers_count=reqbuf.count;
-  int type=V4L2_BUF_TYPE_VIDEO_CAPTURE; 
-  if(-1==ioctl(state->fd,VIDIOC_STREAMON,&type))
-    {
-    LogMessage("v4l2: could not initialize stream");
-    return false;
+  
+  void
+  VideoReturnBuffer(State *state)
+  {
+    if (-1 == tryIoctl(state->fd, VIDIOC_QBUF, state->buf)) {
+      ostringstream msg;
+      msg << "error: could not get next image buffer: " << strerror(errno);
+      LogMessage(msg.str().c_str());
+      return;
     }
-  else
-    {
-    LogMessage("v4l2: initialized data stream");
+  }
+  
+  bool
+  VideoClose(State *state)
+  {
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (-1 == tryIoctl(state->fd, VIDIOC_STREAMOFF, &type)) {
+      ostringstream msg;
+      msg << "error setting streamoff: " << strerror(errno);
+      LogMessage(msg.str().c_str());
+      return false;
     }
-  return true;
-}
+  
+    unsigned int i;
+    for (i = 0; i < state->buffers_count; i++)
+      munmap(state->buffers[i].start, state->buffers[i].length);
+    close(state->fd);
+    free(state->buf);
+  
+    state->fd = 0;
+    state->W = 0;
+    state->H = 0;
+    state->buffers_count = 0;
+    state->buffers = 0;
+  
+    return true;
+  }
 
+  int initDevice(const char* devicePath, long requestedWidth, long requestedHeight)
+  {
+    struct v4l2_capability cap;
+    struct v4l2_format fmt;
 
+    state->fd = open(devicePath, O_RDWR);
+  
+    if (-1 == state->fd) {
+      LogMessage("could not open the video device");
+      return false;
+    }
+    LogMessage("opened device");
 
+    if (-1 == tryIoctl(state->fd, VIDIOC_QUERYCAP, &cap)) {
+      ostringstream msg;
+      if (EINVAL == errno) {
+        msg << "error: device is not a v4l2 device";
+      } else {
+        msg << "error: could not query v4l2 capabilities: " << strerror(errno);
+      }
+      LogMessage(msg.str().c_str());
+      return DEVICE_ERR;
+    }
 
+    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
+      ostringstream msg;
+      msg << "error: device is not a v4l2 capture device";
+      LogMessage(msg.str().c_str());
+      return DEVICE_ERR;
+    }
 
+    memset(&fmt, 0, sizeof(fmt));
 
+    fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+    fmt.fmt.pix.field       = V4L2_FIELD_INTERLACED;
+    fmt.fmt.pix.height      = (unsigned) requestedWidth;
+    fmt.fmt.pix.width       = (unsigned) requestedHeight;
+
+    if (-1 == tryIoctl(state->fd, VIDIOC_S_FMT, &fmt)) {
+      ostringstream msg;
+      msg << "error: could not set format YUYV: " << strerror(errno);
+      LogMessage(msg.str().c_str());
+      return DEVICE_ERR;
+    }
+
+    if (fmt.fmt.pix.width != requestedWidth) {
+      ostringstream msg;
+      msg << "warning: device did not match requested pixel width: " << fmt.fmt.pix.width;
+      LogMessage(msg.str().c_str());
+      // not necessarily fatal
+    }
+
+    if (fmt.fmt.pix.height != requestedHeight) {
+      ostringstream msg;
+      msg << "warning: device did not match requested pixel height: " << fmt.fmt.pix.height;
+      LogMessage(msg.str().c_str());
+      // not necessarily fatal
+    }
+
+    state->W = fmt.fmt.pix.width;
+    state->H = fmt.fmt.pix.height;
+
+    ostringstream formatMsg;
+    formatMsg << "device is configured for " << state->W << "x" << state->H << " pixel"
+              << " and " << fmt.fmt.pix.bytesperline << " bytes per line ("
+              << (fmt.fmt.pix.bytesperline / state->H) <<" bpp)";
+    LogMessage(formatMsg.str().c_str());
+    return DEVICE_OK;
+  }
+
+  bool
+  VideoInit(State* state)
+  {
+    char devicePath[MM::MaxStrLength];
+    int ret = GetProperty(gPropertyDevicePath, devicePath);
+    if (ret != DEVICE_OK) {
+      LogMessage("could not read device path property");
+      return false;
+    }
+
+    long requestedWidth;
+    ret = GetProperty(gPropertyNameWidth, requestedWidth);
+    if (ret != DEVICE_OK) {
+      LogMessage("could not read device width property");
+      return false;
+    }
+
+    long requestedHeight;
+    ret = GetProperty(gPropertyNameHeight, requestedHeight);
+    if (ret != DEVICE_OK) {
+      LogMessage("could not read device height property");
+      return false;
+    }
+
+    ret = initDevice(devicePath, requestedWidth, requestedHeight);
+    if (ret != DEVICE_OK)
+      return false;
+
+    struct v4l2_requestbuffers reqbuf;
+    memset(&reqbuf, 0, sizeof(reqbuf));
+    reqbuf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    reqbuf.memory = V4L2_MEMORY_MMAP;
+    reqbuf.count = 4;
+    if (-1 != tryIoctl(state->fd, VIDIOC_REQBUFS, &reqbuf)) {
+      ostringstream msg;
+      if (EINVAL == errno) {
+        msg << "error: the device does not support memory mapping";
+      }
+      else {
+        msg << "error: could not request memory map buffers: "
+            << strerror(errno) << " (errno " << errno << ")";
+      }
+      LogMessage(msg.str().c_str());
+      return false;
+    }
+
+    state->buffers = (struct VidBuffer*)calloc(reqbuf.count, sizeof(*(state->buffers)));
+    if (!state->buffers) {
+      LogMessage("could not allocate buffer(s)");
+      return false;
+    }
+
+    state->buf = (struct v4l2_buffer*) malloc(sizeof(struct v4l2_buffer));
+
+    unsigned int i;
+    for (i = 0; i < reqbuf.count; i++) {
+      struct v4l2_buffer buf;
+      memset(&buf, 0 , sizeof(buf));
+
+      buf.type = reqbuf.type;
+      buf.memory = V4L2_MEMORY_MMAP;
+      buf.index = i;
+      if (-1 == tryIoctl(state->fd, VIDIOC_QUERYBUF, &buf)) {
+        LogMessage("could not query the buffer state");
+        return false;
+      }
+
+      state->buffers[i].length = buf.length; // remember for munmap
+      state->buffers[i].start = mmap(NULL, buf.length,
+          PROT_READ | PROT_WRITE,
+          MAP_SHARED, state->fd, buf.m.offset);
+
+      if (state->buffers[i].start == MAP_FAILED) {
+        LogMessage("memory map failed");
+        return false;
+      }
+
+      if (-1 == tryIoctl(state->fd, VIDIOC_QBUF, &buf)) {
+        LogMessage("could not enqueue buffer");
+        return false;
+      }
+    }
+
+    state->buffers_count = reqbuf.count;
+
+    ret = this->resizeBuffer();
+    if (ret != DEVICE_OK)
+      return false;
+
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE; 
+    if (-1 == tryIoctl(state->fd, VIDIOC_STREAMON, &type)) {
+      LogMessage("could not initialize stream");
+      return false;
+    }
+
+    LogMessage("initialized data stream");
+    return true;
+  }
 
   // set all variables to default values, create only necessary device
   // properties we need for defining initialisation parameters, do as
@@ -366,9 +422,7 @@ VideoInit(State*state)
   V4L2() :
     pixelType(&PIXELTYPE_8BIT)
   {
-    initialized_=0;
-    state->W=gWidth;
-    state->H=gHeight;
+    initialized_ = 0;
   }
 
   // Shutdown is always called before destructor, in any case release
@@ -383,21 +437,36 @@ VideoInit(State*state)
   {
     if(initialized_)
       return DEVICE_OK;
-    LogMessage("v4l2: initializing device driver");
-    CreateProperty(MM::g_Keyword_Name,gName,
-		   MM::String, true);
-    CreateProperty(MM::g_Keyword_Description, gDescription,
-		   MM::String, true);
+    LogMessage("initializing device driver");
+
+    CreateProperty(MM::g_Keyword_Name, gName, MM::String, true);
+
+    CreateProperty(MM::g_Keyword_Description, gDescription, MM::String, true);
+
+    // Device Path
+    CPropertyAction* pAct = new CPropertyAction(this, &V4L2::OnDevicePath);
+    int nRet = CreateProperty(
+        gPropertyDevicePath, gPropertyDevicePathDefault, MM::String, false, pAct, true);
+    if (nRet != DEVICE_OK)
+      return nRet;
+
+    // Resolution
+    nRet = CreateIntegerProperty(gPropertyNameWidth, gWidthDefault, false, 0, true);
+    if (nRet != DEVICE_OK)
+      return nRet;
+
+    nRet = CreateIntegerProperty(gPropertyNameHeight, gHeightDefault, false, 0, true);
+    if (nRet != DEVICE_OK)
+      return nRet;
+
     // Binning
-    CPropertyAction* pAct =
-      new CPropertyAction(this, &V4L2::OnBinning);
-    int nRet = CreateProperty(MM::g_Keyword_Binning,
-			      "1", MM::Integer, false, pAct);
+    pAct = new CPropertyAction(this, &V4L2::OnBinning);
+    nRet = CreateProperty(MM::g_Keyword_Binning, "1", MM::Integer, false, pAct);
     if (nRet != DEVICE_OK)
       return nRet;
 
     // Pixel type
-    pAct = new CPropertyAction (this, &V4L2::OnPixelType);
+    pAct = new CPropertyAction(this, &V4L2::OnPixelType);
     nRet = CreateProperty(MM::g_Keyword_PixelType,
 			  PixelTypeYUYV::PROPERTY_VALUE.c_str(), MM::String, false, pAct);
     if (nRet != DEVICE_OK)
@@ -411,31 +480,25 @@ VideoInit(State*state)
        return nRet;
 
     // Gain
-    pAct = new CPropertyAction (this, &V4L2::OnGain);
+    pAct = new CPropertyAction(this, &V4L2::OnGain);
     nRet = CreateProperty(MM::g_Keyword_Gain,
 			  "0", MM::Integer, false, pAct);
     assert(nRet == DEVICE_OK);
+
     // Exposure
-    pAct = new CPropertyAction (this, &V4L2::OnExposure);
-    nRet = CreateProperty(MM::g_Keyword_Exposure,
-			  "0.0", MM::Float, false, pAct);
+    pAct = new CPropertyAction(this, &V4L2::OnExposure);
+    nRet = CreateProperty(MM::g_Keyword_Exposure, "0.0", MM::Float, false, pAct);
     assert(nRet == DEVICE_OK);
     
-    nRet = this->resizeBuffer();
-    if (nRet != DEVICE_OK)
-       return nRet;
-
-    LogMessage("v4l2: calling video init");
-    if(VideoInit(state))
-      {
+    LogMessage("calling video init");
+    if (VideoInit(state)) {
       initialized_=true;
       return DEVICE_OK;
-      }
-    else
-      {
+    }
+    else {
       initialized_=false;
       return DEVICE_ERR;
-      }
+    }
   }
 
   // Shutdown is called multiple times, Initialize will be called
@@ -456,11 +519,11 @@ VideoInit(State*state)
   // blocks until exposure is finished
   int SnapImage()
   {
-    LogMessage("v4l2: snap image called"); // TODO remove
+    LogMessage("snap image called"); // TODO remove
     unsigned char* data = VideoTakeBuffer(state);
     pixelType->convertV4l2ToOutput(state, data, const_cast<unsigned char*>(imageBuffer.GetPixels()));
     VideoReturnBuffer(state);
-    LogMessage("v4l2: snap image returning data"); // TODO remove
+    LogMessage("snap image returning data"); // TODO remove
     return DEVICE_OK;
   }
 
@@ -498,8 +561,7 @@ VideoInit(State*state)
   int SetBinning(int binSize)
   {
     // FIXME  set_binning(binSize);
-    SetProperty(MM::g_Keyword_Binning,
-		CDeviceUtils::ConvertToString(binSize));
+    SetProperty(MM::g_Keyword_Binning, CDeviceUtils::ConvertToString(binSize));
     return DEVICE_OK;
   }
 
@@ -513,8 +575,7 @@ VideoInit(State*state)
   {
     // FIXME
     // set_exposure(exp);
-    SetProperty(MM::g_Keyword_Exposure,
-		CDeviceUtils::ConvertToString(exp));
+    SetProperty(MM::g_Keyword_Exposure, CDeviceUtils::ConvertToString(exp));
   }
 
   int GetROI(unsigned&x,
@@ -549,6 +610,29 @@ VideoInit(State*state)
     return DEVICE_OK;
   }
 
+  int OnDevicePath(MM::PropertyBase* pProp, MM::ActionType eAct)
+  {
+    if (eAct==MM::AfterSet) {
+      ostringstream msg;
+      string devicePath;
+      pProp->Get(devicePath);
+      msg << "device path changed to " << devicePath;
+      LogMessage(msg.str());
+
+      if (initialized_) {
+        LogMessage("closing current device");
+        if (! VideoClose(state)) { // TODO tell video capture (stream) to wait until finished
+          return DEVICE_ERR;
+        }
+        if (! VideoInit(state)) {
+          return DEVICE_ERR;
+        }
+      }
+    }
+
+    return DEVICE_OK;
+  }
+
   int OnBinning(MM::PropertyBase* pProp, MM::ActionType eAct)
   {
     if(eAct == MM::BeforeGet){
@@ -574,7 +658,7 @@ VideoInit(State*state)
         return DEVICE_INVALID_PROPERTY;
       }
   
-      LogMessage("v4l2: setting pixelType " + pixelType->GetPropertyValue());
+      LogMessage("setting pixelType " + pixelType->GetPropertyValue());
       return this->resizeBuffer();
     }
     else if (eAct == MM::BeforeGet)
@@ -592,11 +676,47 @@ VideoInit(State*state)
     }
     return DEVICE_OK;
   }
+
+  /**
+   * TODO: implement if possible
+   */
+  int IsExposureSequenceable(bool& isSequenceable) const 
+  {
+     isSequenceable = false; 
+     return DEVICE_OK;
+  }
   
 private:
+  // TODO init video / device private 
   int resizeBuffer() {
     imageBuffer.Resize(state->W, state->H, pixelType->GetImageBytesPerPixel());
     return DEVICE_OK;
+  }
+
+  int tryIoctl(int fd, unsigned long ioctlCode, void *parameter) const
+  {
+      while (-1 == ioctl(fd, ioctlCode, parameter)) {
+          if (!(errno == EBUSY || errno == EAGAIN))
+              return -1;
+  
+          fd_set fds;
+          FD_ZERO(&fds);
+          FD_SET(fd, &fds);
+  
+          struct timeval tv;
+          tv.tv_sec = 10;
+          tv.tv_usec = 0;
+  
+          int result = select(fd + 1, &fds, NULL, NULL, &tv);
+          if (0 == result) {
+            LogMessage("tryIoctl select timeout");
+            return -1;
+          }
+          else if (-1 == result && EINTR != errno) {
+            return -1;
+          }
+      }
+      return 0;
   }
 
   bool initialized_;
