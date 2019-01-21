@@ -220,7 +220,7 @@ public:
   }
   
   bool
-  VideoClose(State *state)
+  VideoClose()
   {
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (-1 == tryIoctl(state->fd, VIDIOC_STREAMOFF, &type)) {
@@ -245,7 +245,8 @@ public:
     return true;
   }
 
-  int initDevice(const char* devicePath, long requestedWidth, long requestedHeight)
+  int
+  initDevice(const char* devicePath, long requestedWidth, long requestedHeight)
   {
     struct v4l2_capability cap;
     struct v4l2_format fmt;
@@ -293,14 +294,16 @@ public:
 
     if (fmt.fmt.pix.width != requestedWidth) {
       ostringstream msg;
-      msg << "warning: device did not match requested pixel width: " << fmt.fmt.pix.width;
+      msg << "warning: device did not match requested pixel width: "
+          << fmt.fmt.pix.width << " requested: " << requestedWidth;
       LogMessage(msg.str().c_str());
       // not necessarily fatal
     }
 
     if (fmt.fmt.pix.height != requestedHeight) {
       ostringstream msg;
-      msg << "warning: device did not match requested pixel height: " << fmt.fmt.pix.height;
+      msg << "warning: device did not match requested pixel height: "
+          << fmt.fmt.pix.height << " requested: " << requestedHeight;
       LogMessage(msg.str().c_str());
       // not necessarily fatal
     }
@@ -317,7 +320,7 @@ public:
   }
 
   bool
-  VideoInit(State* state)
+  VideoInit()
   {
     char devicePath[MM::MaxStrLength];
     int ret = GetProperty(gPropertyDevicePath, devicePath);
@@ -349,7 +352,8 @@ public:
     reqbuf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     reqbuf.memory = V4L2_MEMORY_MMAP;
     reqbuf.count = 4;
-    if (-1 != tryIoctl(state->fd, VIDIOC_REQBUFS, &reqbuf)) {
+
+    if (-1 == tryIoctl(state->fd, VIDIOC_REQBUFS, &reqbuf)) {
       ostringstream msg;
       if (EINVAL == errno) {
         msg << "error: the device does not support memory mapping";
@@ -361,6 +365,10 @@ public:
       LogMessage(msg.str().c_str());
       return false;
     }
+
+    ostringstream bufMsg;
+    bufMsg << "got " << reqbuf.count << " out of 4 requested buffers";
+    LogMessage(bufMsg.str().c_str());
 
     state->buffers = (struct VidBuffer*)calloc(reqbuf.count, sizeof(*(state->buffers)));
     if (!state->buffers) {
@@ -446,16 +454,16 @@ public:
     // Device Path
     CPropertyAction* pAct = new CPropertyAction(this, &V4L2::OnDevicePath);
     int nRet = CreateProperty(
-        gPropertyDevicePath, gPropertyDevicePathDefault, MM::String, false, pAct, true);
+        gPropertyDevicePath, gPropertyDevicePathDefault, MM::String, false, pAct);
     if (nRet != DEVICE_OK)
       return nRet;
 
     // Resolution
-    nRet = CreateIntegerProperty(gPropertyNameWidth, gWidthDefault, false, 0, true);
+    nRet = CreateIntegerProperty(gPropertyNameWidth, gWidthDefault, false, 0);
     if (nRet != DEVICE_OK)
       return nRet;
 
-    nRet = CreateIntegerProperty(gPropertyNameHeight, gHeightDefault, false, 0, true);
+    nRet = CreateIntegerProperty(gPropertyNameHeight, gHeightDefault, false, 0);
     if (nRet != DEVICE_OK)
       return nRet;
 
@@ -491,21 +499,22 @@ public:
     assert(nRet == DEVICE_OK);
     
     LogMessage("calling video init");
-    if (VideoInit(state)) {
-      initialized_=true;
+    if (VideoInit()) {
+      initialized_ = true;
       return DEVICE_OK;
     }
     else {
-      initialized_=false;
+      initialized_ = false;
       return DEVICE_ERR;
     }
   }
 
   // Shutdown is called multiple times, Initialize will be called
   // afterwards, unload device, release all resources
-  int Shutdown(){
-    if(initialized_){
-      VideoClose(state);
+  int Shutdown()
+  {
+    if (initialized_) {
+      VideoClose();
     }
     initialized_ = false;
     return DEVICE_OK;
@@ -520,6 +529,7 @@ public:
   int SnapImage()
   {
     LogMessage("snap image called"); // TODO remove
+    // TODO single picture mode returns 4 old ones before a recent one (buffers are filled)
     unsigned char* data = VideoTakeBuffer(state);
     pixelType->convertV4l2ToOutput(state, data, const_cast<unsigned char*>(imageBuffer.GetPixels()));
     VideoReturnBuffer(state);
@@ -621,10 +631,10 @@ public:
 
       if (initialized_) {
         LogMessage("closing current device");
-        if (! VideoClose(state)) { // TODO tell video capture (stream) to wait until finished
+        if (! VideoClose()) { // TODO tell video capture (stream) to wait until finished
           return DEVICE_ERR;
         }
-        if (! VideoInit(state)) {
+        if (! VideoInit()) {
           return DEVICE_ERR;
         }
       }
