@@ -622,6 +622,9 @@ public:
   int OnDevicePath(MM::PropertyBase* pProp, MM::ActionType eAct)
   {
     if (eAct == MM::AfterSet) {
+      if (IsCapturing())
+         return DEVICE_CAMERA_BUSY_ACQUIRING;
+
       ostringstream msg;
       string devicePath;
       pProp->Get(devicePath);
@@ -637,6 +640,9 @@ public:
   int OnResolutionChange(MM::PropertyBase* pProp, MM::ActionType eAct)
   {
     if (eAct == MM::AfterSet) {
+      if (IsCapturing())
+         return DEVICE_CAMERA_BUSY_ACQUIRING;
+
       ostringstream msg;
       string devicePath;
       pProp->Get(devicePath);
@@ -662,6 +668,9 @@ public:
   {
     if (eAct == MM::AfterSet)
     {
+      if (IsCapturing())
+         return DEVICE_CAMERA_BUSY_ACQUIRING;
+
       string pixType;
       pProp->Get(pixType);
       if (pixType == PixelType8Bit::PROPERTY_VALUE) {
