@@ -73,8 +73,8 @@ const char
   *gDescription="video4linux2 camera device adapter",
   *gPropertyDevicePath = "DevicePath",
   *gPropertyDevicePathDefault = "/dev/video0",
-  *gPropertyNameWidth = "ResolutionWidth",
-  *gPropertyNameHeight = "ResolutionHeight";
+  *gPropertyNameResolution = "Resolution",
+  *gResolutionDefault = "640x480";
 
 const long gWidthDefault = 640,
            gHeightDefault = 480;
@@ -329,17 +329,18 @@ public:
       return false;
     }
 
-    long requestedWidth;
-    ret = GetProperty(gPropertyNameWidth, requestedWidth);
+    char resolutionString[MM::MaxStrLength];
+    ret = GetProperty(gPropertyNameResolution, resolutionString);
     if (ret != DEVICE_OK) {
-      LogMessage("could not read device width property");
+      LogMessage("could not read device resolution property");
       return false;
     }
 
-    long requestedHeight;
-    ret = GetProperty(gPropertyNameHeight, requestedHeight);
+    long requestedWidth = gWidthDefault;
+    long requestedHeight = gHeightDefault;
+    ret = parseResolution(resolutionString, requestedWidth, requestedHeight);
     if (ret != DEVICE_OK) {
-      LogMessage("could not read device height property");
+      LogMessage("could not parse device resolution property value");
       return false;
     }
 
@@ -459,11 +460,9 @@ public:
       return nRet;
 
     // Resolution
-    nRet = CreateIntegerProperty(gPropertyNameWidth, gWidthDefault, false, 0);
-    if (nRet != DEVICE_OK)
-      return nRet;
-
-    nRet = CreateIntegerProperty(gPropertyNameHeight, gHeightDefault, false, 0);
+    pAct = new CPropertyAction(this, &V4L2::OnResolutionChange);
+    nRet = CreateProperty(
+        gPropertyNameResolution, gResolutionDefault, MM::String, false, pAct);
     if (nRet != DEVICE_OK)
       return nRet;
 
@@ -622,22 +621,29 @@ public:
 
   int OnDevicePath(MM::PropertyBase* pProp, MM::ActionType eAct)
   {
-    if (eAct==MM::AfterSet) {
+    if (eAct == MM::AfterSet) {
       ostringstream msg;
       string devicePath;
       pProp->Get(devicePath);
+
       msg << "device path changed to " << devicePath;
       LogMessage(msg.str());
+      reinitializeDeviceIfRunning();
+    }
 
-      if (initialized_) {
-        LogMessage("closing current device");
-        if (! VideoClose()) { // TODO tell video capture (stream) to wait until finished
-          return DEVICE_ERR;
-        }
-        if (! VideoInit()) {
-          return DEVICE_ERR;
-        }
-      }
+    return DEVICE_OK;
+  }
+
+  int OnResolutionChange(MM::PropertyBase* pProp, MM::ActionType eAct)
+  {
+    if (eAct == MM::AfterSet) {
+      ostringstream msg;
+      string devicePath;
+      pProp->Get(devicePath);
+
+      msg << "resolution changed to " << devicePath;
+      LogMessage(msg.str());
+      reinitializeDeviceIfRunning();
     }
 
     return DEVICE_OK;
@@ -698,6 +704,48 @@ public:
   
 private:
   // TODO init video / device private 
+  
+  int reinitializeDeviceIfRunning() {
+    if (initialized_) {
+      LogMessage("closing current device");
+      if (! VideoClose()) { // TODO tell video capture (stream) to wait until finished
+        return DEVICE_ERR;
+      }
+      if (! VideoInit()) {
+        return DEVICE_ERR;
+      }
+    }
+    return DEVICE_OK;
+  }
+  
+  int parseResolution(const char* resolutionString, long &width, long &height) {
+    long parsedWidth = 0;
+    long parsedHeight = 0;
+    int matched = sscanf(resolutionString, "%ldx%ld", &parsedWidth, &parsedHeight);
+
+    if (matched == 2) {
+      width = parsedWidth;
+      height = parsedHeight;
+
+      return DEVICE_OK;
+    }
+    else if (errno != 0) {
+      ostringstream msg;
+      msg << "error: could not parse resolution: " << strerror(errno);
+      LogMessage(msg.str().c_str());
+      return DEVICE_INVALID_PROPERTY;
+    }
+    else {
+      LogMessage("resolution not in format 'WxH'");
+      return DEVICE_INVALID_PROPERTY;
+    }
+
+    width = parsedWidth;
+    height = parsedHeight;
+
+    return DEVICE_OK;
+  }
+  
   int resizeBuffer() {
     imageBuffer.Resize(state->W, state->H, pixelType->GetImageBytesPerPixel());
     return DEVICE_OK;
