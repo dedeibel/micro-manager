@@ -189,240 +189,6 @@ PixelTypeYUYV PIXELTYPE_YUYV;
 class V4L2 : public CCameraBase<V4L2>
 {
 public:
-  /*  has to be followed by a call to videoreturnbuffer */
-  unsigned char*
-  VideoTakeBuffer(State*state)
-  {
-    memset(state->buf, 0, sizeof(struct v4l2_buffer));
-    state->buf->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    state->buf->memory = V4L2_MEMORY_MMAP;
-    // By default VIDIOC_DQBUF blocks when no buffer is in the outgoing queue
-    if (-1 == tryIoctl(state->fd, VIDIOC_DQBUF, state->buf)) {
-      ostringstream msg;
-      msg << "error: could not prepare next image buffer: " << strerror(errno);
-      LogMessage(msg.str().c_str());
-      assert(false);
-    }
-
-    assert(state->buf->index < state->buffers_count);
-    return (unsigned char*)state->buffers[state->buf->index].start;
-  }
-  
-  void
-  VideoReturnBuffer(State *state)
-  {
-    if (-1 == tryIoctl(state->fd, VIDIOC_QBUF, state->buf)) {
-      ostringstream msg;
-      msg << "error: could not get next image buffer: " << strerror(errno);
-      LogMessage(msg.str().c_str());
-      return;
-    }
-  }
-  
-  bool
-  VideoClose()
-  {
-    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    if (-1 == tryIoctl(state->fd, VIDIOC_STREAMOFF, &type)) {
-      ostringstream msg;
-      msg << "error setting streamoff: " << strerror(errno);
-      LogMessage(msg.str().c_str());
-      return false;
-    }
-  
-    unsigned int i;
-    for (i = 0; i < state->buffers_count; i++)
-      munmap(state->buffers[i].start, state->buffers[i].length);
-    close(state->fd);
-    free(state->buf);
-  
-    state->fd = 0;
-    state->W = 0;
-    state->H = 0;
-    state->buffers_count = 0;
-    state->buffers = 0;
-  
-    return true;
-  }
-
-  int
-  initDevice(const char* devicePath, long requestedWidth, long requestedHeight)
-  {
-    struct v4l2_capability cap;
-    struct v4l2_format fmt;
-
-    state->fd = open(devicePath, O_RDWR);
-  
-    if (-1 == state->fd) {
-      LogMessage("could not open the video device");
-      return false;
-    }
-    LogMessage("opened device");
-
-    if (-1 == tryIoctl(state->fd, VIDIOC_QUERYCAP, &cap)) {
-      ostringstream msg;
-      if (EINVAL == errno) {
-        msg << "error: device is not a v4l2 device";
-      } else {
-        msg << "error: could not query v4l2 capabilities: " << strerror(errno);
-      }
-      LogMessage(msg.str().c_str());
-      return DEVICE_ERR;
-    }
-
-    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
-      ostringstream msg;
-      msg << "error: device is not a v4l2 capture device";
-      LogMessage(msg.str().c_str());
-      return DEVICE_ERR;
-    }
-
-    memset(&fmt, 0, sizeof(fmt));
-
-    fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
-    fmt.fmt.pix.field       = V4L2_FIELD_INTERLACED;
-    fmt.fmt.pix.height      = (unsigned) requestedWidth;
-    fmt.fmt.pix.width       = (unsigned) requestedHeight;
-
-    if (-1 == tryIoctl(state->fd, VIDIOC_S_FMT, &fmt)) {
-      ostringstream msg;
-      msg << "error: could not set format YUYV: " << strerror(errno);
-      LogMessage(msg.str().c_str());
-      return DEVICE_ERR;
-    }
-
-    if (fmt.fmt.pix.width != requestedWidth) {
-      ostringstream msg;
-      msg << "warning: device did not match requested pixel width: "
-          << fmt.fmt.pix.width << " requested: " << requestedWidth;
-      LogMessage(msg.str().c_str());
-      // not necessarily fatal
-    }
-
-    if (fmt.fmt.pix.height != requestedHeight) {
-      ostringstream msg;
-      msg << "warning: device did not match requested pixel height: "
-          << fmt.fmt.pix.height << " requested: " << requestedHeight;
-      LogMessage(msg.str().c_str());
-      // not necessarily fatal
-    }
-
-    state->W = fmt.fmt.pix.width;
-    state->H = fmt.fmt.pix.height;
-
-    ostringstream formatMsg;
-    formatMsg << "device is configured for " << state->W << "x" << state->H << " pixel"
-              << " and " << fmt.fmt.pix.bytesperline << " bytes per line ("
-              << (fmt.fmt.pix.bytesperline / state->H) <<" bpp)";
-    LogMessage(formatMsg.str().c_str());
-    return DEVICE_OK;
-  }
-
-  bool
-  VideoInit()
-  {
-    char devicePath[MM::MaxStrLength];
-    int ret = GetProperty(gPropertyDevicePath, devicePath);
-    if (ret != DEVICE_OK) {
-      LogMessage("could not read device path property");
-      return false;
-    }
-
-    char resolutionString[MM::MaxStrLength];
-    ret = GetProperty(gPropertyNameResolution, resolutionString);
-    if (ret != DEVICE_OK) {
-      LogMessage("could not read device resolution property");
-      return false;
-    }
-
-    long requestedWidth = gWidthDefault;
-    long requestedHeight = gHeightDefault;
-    ret = parseResolution(resolutionString, requestedWidth, requestedHeight);
-    if (ret != DEVICE_OK) {
-      LogMessage("could not parse device resolution property value");
-      return false;
-    }
-
-    ret = initDevice(devicePath, requestedWidth, requestedHeight);
-    if (ret != DEVICE_OK)
-      return false;
-
-    struct v4l2_requestbuffers reqbuf;
-    memset(&reqbuf, 0, sizeof(reqbuf));
-    reqbuf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    reqbuf.memory = V4L2_MEMORY_MMAP;
-    reqbuf.count = 4;
-
-    if (-1 == tryIoctl(state->fd, VIDIOC_REQBUFS, &reqbuf)) {
-      ostringstream msg;
-      if (EINVAL == errno) {
-        msg << "error: the device does not support memory mapping";
-      }
-      else {
-        msg << "error: could not request memory map buffers: "
-            << strerror(errno) << " (errno " << errno << ")";
-      }
-      LogMessage(msg.str().c_str());
-      return false;
-    }
-
-    ostringstream bufMsg;
-    bufMsg << "got " << reqbuf.count << " out of 4 requested buffers";
-    LogMessage(bufMsg.str().c_str());
-
-    state->buffers = (struct VidBuffer*)calloc(reqbuf.count, sizeof(*(state->buffers)));
-    if (!state->buffers) {
-      LogMessage("could not allocate buffer(s)");
-      return false;
-    }
-
-    state->buf = (struct v4l2_buffer*) malloc(sizeof(struct v4l2_buffer));
-
-    unsigned int i;
-    for (i = 0; i < reqbuf.count; i++) {
-      struct v4l2_buffer buf;
-      memset(&buf, 0 , sizeof(buf));
-
-      buf.type = reqbuf.type;
-      buf.memory = V4L2_MEMORY_MMAP;
-      buf.index = i;
-      if (-1 == tryIoctl(state->fd, VIDIOC_QUERYBUF, &buf)) {
-        LogMessage("could not query the buffer state");
-        return false;
-      }
-
-      state->buffers[i].length = buf.length; // remember for munmap
-      state->buffers[i].start = mmap(NULL, buf.length,
-          PROT_READ | PROT_WRITE,
-          MAP_SHARED, state->fd, buf.m.offset);
-
-      if (state->buffers[i].start == MAP_FAILED) {
-        LogMessage("memory map failed");
-        return false;
-      }
-
-      if (-1 == tryIoctl(state->fd, VIDIOC_QBUF, &buf)) {
-        LogMessage("could not enqueue buffer");
-        return false;
-      }
-    }
-
-    state->buffers_count = reqbuf.count;
-
-    ret = this->resizeBuffer();
-    if (ret != DEVICE_OK)
-      return false;
-
-    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE; 
-    if (-1 == tryIoctl(state->fd, VIDIOC_STREAMON, &type)) {
-      LogMessage("could not initialize stream");
-      return false;
-    }
-
-    LogMessage("initialized data stream");
-    return true;
-  }
 
   // set all variables to default values, create only necessary device
   // properties we need for defining initialisation parameters, do as
@@ -527,12 +293,9 @@ public:
   // blocks until exposure is finished
   int SnapImage()
   {
-    LogMessage("snap image called"); // TODO remove
-    // TODO single picture mode returns 4 old ones before a recent one (buffers are filled)
-    unsigned char* data = VideoTakeBuffer(state);
+    unsigned char* data = VideoTakeBuffer();
     pixelType->convertV4l2ToOutput(state, data, const_cast<unsigned char*>(imageBuffer.GetPixels()));
-    VideoReturnBuffer(state);
-    LogMessage("snap image returning data"); // TODO remove
+    VideoReturnBuffer();
     return DEVICE_OK;
   }
 
@@ -712,12 +475,246 @@ public:
   }
   
 private:
-  // TODO init video / device private 
+
+  bool
+  VideoInit()
+  {
+    char devicePath[MM::MaxStrLength];
+    int ret = GetProperty(gPropertyDevicePath, devicePath);
+    if (ret != DEVICE_OK) {
+      LogMessage("could not read device path property");
+      return false;
+    }
+
+    char resolutionString[MM::MaxStrLength];
+    ret = GetProperty(gPropertyNameResolution, resolutionString);
+    if (ret != DEVICE_OK) {
+      LogMessage("could not read device resolution property");
+      return false;
+    }
+
+    long requestedWidth = gWidthDefault;
+    long requestedHeight = gHeightDefault;
+    ret = parseResolution(resolutionString, requestedWidth, requestedHeight);
+    if (ret != DEVICE_OK) {
+      LogMessage("could not parse device resolution property value");
+      return false;
+    }
+
+    ret = initDevice(devicePath, requestedWidth, requestedHeight);
+    if (ret != DEVICE_OK)
+      return false;
+
+    struct v4l2_requestbuffers reqbuf;
+    memset(&reqbuf, 0, sizeof(reqbuf));
+    reqbuf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    reqbuf.memory = V4L2_MEMORY_MMAP;
+    reqbuf.count = 4;
+
+    if (-1 == tryIoctl(state->fd, VIDIOC_REQBUFS, &reqbuf)) {
+      ostringstream msg;
+      if (EINVAL == errno) {
+        msg << "error: the device does not support memory mapping";
+      }
+      else {
+        msg << "error: could not request memory map buffers: "
+            << strerror(errno) << " (errno " << errno << ")";
+      }
+      LogMessage(msg.str().c_str());
+      return false;
+    }
+
+    ostringstream bufMsg;
+    bufMsg << "got " << reqbuf.count << " out of 4 requested buffers";
+    LogMessage(bufMsg.str().c_str());
+
+    state->buffers = (struct VidBuffer*)calloc(reqbuf.count, sizeof(*(state->buffers)));
+    if (!state->buffers) {
+      LogMessage("could not allocate buffer(s)");
+      return false;
+    }
+
+    state->buf = (struct v4l2_buffer*) malloc(sizeof(struct v4l2_buffer));
+
+    unsigned int i;
+    for (i = 0; i < reqbuf.count; i++) {
+      struct v4l2_buffer buf;
+      memset(&buf, 0 , sizeof(buf));
+
+      buf.type = reqbuf.type;
+      buf.memory = V4L2_MEMORY_MMAP;
+      buf.index = i;
+      if (-1 == tryIoctl(state->fd, VIDIOC_QUERYBUF, &buf)) {
+        LogMessage("could not query the buffer state");
+        return false;
+      }
+
+      state->buffers[i].length = buf.length; // remember for munmap
+      state->buffers[i].start = mmap(NULL, buf.length,
+          PROT_READ | PROT_WRITE,
+          MAP_SHARED, state->fd, buf.m.offset);
+
+      if (state->buffers[i].start == MAP_FAILED) {
+        LogMessage("memory map failed");
+        return false;
+      }
+
+      if (-1 == tryIoctl(state->fd, VIDIOC_QBUF, &buf)) {
+        LogMessage("could not enqueue buffer");
+        return false;
+      }
+    }
+
+    state->buffers_count = reqbuf.count;
+
+    ret = this->resizeBuffer();
+    if (ret != DEVICE_OK)
+      return false;
+
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE; 
+    if (-1 == tryIoctl(state->fd, VIDIOC_STREAMON, &type)) {
+      LogMessage("could not initialize stream");
+      return false;
+    }
+
+    LogMessage("initialized data stream");
+    return true;
+  }
+
+  int
+  initDevice(const char* devicePath, long requestedWidth, long requestedHeight)
+  {
+    struct v4l2_capability cap;
+    struct v4l2_format fmt;
+
+    state->fd = open(devicePath, O_RDWR);
   
+    if (-1 == state->fd) {
+      LogMessage("could not open the video device");
+      return false;
+    }
+    LogMessage("opened device");
+
+    if (-1 == tryIoctl(state->fd, VIDIOC_QUERYCAP, &cap)) {
+      ostringstream msg;
+      if (EINVAL == errno) {
+        msg << "error: device is not a v4l2 device";
+      } else {
+        msg << "error: could not query v4l2 capabilities: " << strerror(errno);
+      }
+      LogMessage(msg.str().c_str());
+      return DEVICE_ERR;
+    }
+
+    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
+      ostringstream msg;
+      msg << "error: device is not a v4l2 capture device";
+      LogMessage(msg.str().c_str());
+      return DEVICE_ERR;
+    }
+
+    memset(&fmt, 0, sizeof(fmt));
+
+    fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+    fmt.fmt.pix.field       = V4L2_FIELD_INTERLACED;
+    fmt.fmt.pix.height      = (unsigned) requestedWidth;
+    fmt.fmt.pix.width       = (unsigned) requestedHeight;
+
+    if (-1 == tryIoctl(state->fd, VIDIOC_S_FMT, &fmt)) {
+      ostringstream msg;
+      msg << "error: could not set format YUYV: " << strerror(errno);
+      LogMessage(msg.str().c_str());
+      return DEVICE_ERR;
+    }
+
+    if (fmt.fmt.pix.width != requestedWidth) {
+      ostringstream msg;
+      msg << "warning: device did not match requested pixel width: "
+          << fmt.fmt.pix.width << " requested: " << requestedWidth;
+      LogMessage(msg.str().c_str());
+      // not necessarily fatal
+    }
+
+    if (fmt.fmt.pix.height != requestedHeight) {
+      ostringstream msg;
+      msg << "warning: device did not match requested pixel height: "
+          << fmt.fmt.pix.height << " requested: " << requestedHeight;
+      LogMessage(msg.str().c_str());
+      // not necessarily fatal
+    }
+
+    state->W = fmt.fmt.pix.width;
+    state->H = fmt.fmt.pix.height;
+
+    ostringstream formatMsg;
+    formatMsg << "device is configured for " << state->W << "x" << state->H << " pixel"
+              << " and " << fmt.fmt.pix.bytesperline << " bytes per line ("
+              << (fmt.fmt.pix.bytesperline / state->H) <<" bpp)";
+    LogMessage(formatMsg.str().c_str());
+    return DEVICE_OK;
+  }
+
+  bool
+  VideoClose()
+  {
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (-1 == tryIoctl(state->fd, VIDIOC_STREAMOFF, &type)) {
+      ostringstream msg;
+      msg << "error setting streamoff: " << strerror(errno);
+      LogMessage(msg.str().c_str());
+      return false;
+    }
+  
+    unsigned int i;
+    for (i = 0; i < state->buffers_count; i++)
+      munmap(state->buffers[i].start, state->buffers[i].length);
+    close(state->fd);
+    free(state->buf);
+  
+    state->fd = 0;
+    state->W = 0;
+    state->H = 0;
+    state->buffers_count = 0;
+    state->buffers = 0;
+  
+    return true;
+  }
+
+  /*  has to be followed by a call to videoreturnbuffer */
+  unsigned char*
+  VideoTakeBuffer()
+  {
+    memset(state->buf, 0, sizeof(struct v4l2_buffer));
+    state->buf->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    state->buf->memory = V4L2_MEMORY_MMAP;
+    // By default VIDIOC_DQBUF blocks when no buffer is in the outgoing queue
+    if (-1 == tryIoctl(state->fd, VIDIOC_DQBUF, state->buf)) {
+      ostringstream msg;
+      msg << "error: could not prepare next image buffer: " << strerror(errno);
+      LogMessage(msg.str().c_str());
+      assert(false);
+    }
+
+    assert(state->buf->index < state->buffers_count);
+    return (unsigned char*)state->buffers[state->buf->index].start;
+  }
+  
+  void
+  VideoReturnBuffer()
+  {
+    if (-1 == tryIoctl(state->fd, VIDIOC_QBUF, state->buf)) {
+      ostringstream msg;
+      msg << "error: could not get next image buffer: " << strerror(errno);
+      LogMessage(msg.str().c_str());
+      return;
+    }
+  }
+
   int reinitializeDeviceIfRunning() {
     if (initialized_) {
       LogMessage("closing current device");
-      if (! VideoClose()) { // TODO tell video capture (stream) to wait until finished
+      if (! VideoClose()) {
         return DEVICE_ERR;
       }
       if (! VideoInit()) {
@@ -755,7 +752,8 @@ private:
     return DEVICE_OK;
   }
   
-  int resizeBuffer() {
+  int resizeBuffer()
+  {
     imageBuffer.Resize(state->W, state->H, pixelType->GetImageBytesPerPixel());
     return DEVICE_OK;
   }
