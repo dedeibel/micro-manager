@@ -24,11 +24,20 @@ strace -f java -Djava.library.path=/usr/lib/micro-manager -classpath /usr/share/
 *
 * Modified:
 *
-* 2018-01-20 Benjamin Peter
+* 2019-02-04 Benjamin Peter
 *
-*            * Adding support for RGB image capturing
-*            * Specify linux device path
-*            * v4l2 configured device resolution
+*            - Adding support for RGB image capturing
+*            - Allow device path to be configured using a property. Reinit the device if it changes.
+*            - Allow the resolution to be configured using properties.
+*            - Used tryioctl function to honor busy state of devices and retry the action.
+*            - Call v4l2 capability negotiation api to get more detailed error messages in case of
+*              incompatible devices.
+*            - Unify logging and leverage errno value of ioctl calls.
+*            - Move some functions into the device class as they are actually accessing it's state
+*            - Rearranged functions to follow the call flow better (init, prepare, read, close, ...)
+*            - Tested using
+*              - USB ID 1871:7670 Aveo Technology Corp. (uvcvideo) - COLEMETER(R) USB 2.0 Digital Microscope
+*              - USB ID 046d:0826 Logitech, Inc. HD Webcam C525
 *
 */
 // LICENSE:       This file is distributed under the "LGPL" license.
